@@ -1,0 +1,37 @@
+# One-click deploy config for Render.com
+services:
+  - type: web
+    name: cvescan-pro-web
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      # AI providers — set the key(s) you have; AI_PROVIDER picks the default.
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-3-5-haiku-latest
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      # CVE data sources
+      - key: NVD_API_KEY
+        sync: false
+      - key: CVESCAN_DATA_DIR
+        value: /var/data/cvescan
+    disk:
+      name: cvescan-data
+      mountPath: /var/data/cvescan
+      sizeGB: 1
