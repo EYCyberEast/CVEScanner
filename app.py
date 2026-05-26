@@ -106,6 +106,7 @@ def _scan_pipeline(targets, full, client, force_sync):
         domains.append({
             "domain": dc, "results": results,
             "wl_matches": wl_matches,
+            "vhosts": scanner.group_virtual_hosts(results),
             "elapsed": f"{time.time() - t0:.1f}s",
         })
 
@@ -124,10 +125,11 @@ def _scan_pipeline(targets, full, client, force_sync):
 
 
 def _scan_stats(domains):
-    all_cves, hosts, wl_hits = [], 0, 0
+    all_cves, hosts, wl_hits, vhosts = [], 0, 0, 0
     for d in domains:
         hosts += len(d["results"])
         wl_hits += len(d["wl_matches"])
+        vhosts += len(d.get("vhosts", []))
         for h in d["results"]:
             all_cves.extend(h["cves"])
     crit = sum(1 for c in all_cves if c["severity"] == "CRITICAL")
@@ -138,7 +140,7 @@ def _scan_stats(domains):
             else "MEDIUM" if med else "LOW")
     return {"domains": len(domains), "hosts": hosts, "total_cves": len(all_cves),
             "critical": crit, "high": high, "medium": med, "kev": kev,
-            "watchlist_hits": wl_hits, "risk": risk}
+            "watchlist_hits": wl_hits, "shared_ips": vhosts, "risk": risk}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -352,7 +354,7 @@ def _all_cves(scan):
 @app.route("/api/ai/explain", methods=["POST"])
 def ai_explain():
     if not ai.ai_available():
-        return jsonify({"ok": False, "error": "Gemini not configured."}), 400
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
     cve = (request.get_json(silent=True) or {}).get("cve")
     if not cve or not cve.get("id"):
         return jsonify({"ok": False, "error": "No CVE supplied."}), 400
@@ -365,7 +367,7 @@ def ai_explain():
 @app.route("/api/ai/summary", methods=["POST"])
 def ai_summary():
     if not ai.ai_available():
-        return jsonify({"ok": False, "error": "Gemini not configured."}), 400
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
     jid = (request.get_json(silent=True) or {}).get("job_id")
     scan = _job_result_or_404(jid)
     try:
@@ -377,7 +379,7 @@ def ai_summary():
 @app.route("/api/ai/triage", methods=["POST"])
 def ai_triage():
     if not ai.ai_available():
-        return jsonify({"ok": False, "error": "Gemini not configured."}), 400
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
     jid = (request.get_json(silent=True) or {}).get("job_id")
     scan = _job_result_or_404(jid)
     cves = _all_cves(scan)
@@ -389,10 +391,23 @@ def ai_triage():
         return jsonify({"ok": False, "error": str(e)}), 502
 
 
+@app.route("/api/ai/deep", methods=["POST"])
+def ai_deep():
+    """AI deep analysis — fingerprint correlation + exploitability assessment."""
+    if not ai.ai_available():
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
+    jid = (request.get_json(silent=True) or {}).get("job_id")
+    scan = _job_result_or_404(jid)
+    try:
+        return jsonify({"ok": True, "result": ai.deep_analysis(scan)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
 @app.route("/api/ai/ask", methods=["POST"])
 def ai_ask():
     if not ai.ai_available():
-        return jsonify({"ok": False, "error": "Gemini not configured."}), 400
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
     data = request.get_json(silent=True) or {}
     scan = _job_result_or_404(data.get("job_id"))
     question = (data.get("question") or "").strip()
@@ -418,10 +433,146 @@ def report(jid):
             mimetype="application/json",
             headers={"Content-Disposition":
                      f"attachment; filename=CVEScan_{ts}.json"})
+    if fmt == "pdf":
+        try:
+            pdf_bytes = build_pdf_report(scan)
+        except Exception as e:
+            return jsonify({"error": f"PDF generation failed: {e}"}), 500
+        return Response(
+            pdf_bytes, mimetype="application/pdf",
+            headers={"Content-Disposition":
+                     f"attachment; filename=CVEScan_{ts}.pdf"})
     html_doc = build_html_report(scan)
     return Response(html_doc, mimetype="text/html",
                     headers={"Content-Disposition":
                              f"attachment; filename=CVEScan_{ts}.html"})
+
+
+def build_pdf_report(scan):
+    """Render the scan as a PDF (via xhtml2pdf — pure Python, no system libs)."""
+    from io import BytesIO
+    from xhtml2pdf import pisa
+    src = build_pdf_html(scan)
+    buf = BytesIO()
+    result = pisa.CreatePDF(src, dest=buf, encoding="utf-8")
+    if result.err:
+        raise RuntimeError("xhtml2pdf reported a rendering error")
+    return buf.getvalue()
+
+
+def build_pdf_html(scan):
+    """A simplified, xhtml2pdf-friendly HTML (table layout, no flex/gradient)."""
+    e = lambda s: html.escape(str(s))
+    sev_c = {"CRITICAL": "#C00000", "HIGH": "#E26B0A",
+             "MEDIUM": "#B8860B", "LOW": "#2E7D32", "UNKNOWN": "#777"}
+    st = scan["stats"]
+    today = datetime.date.today().strftime("%d %B %Y")
+    rc = sev_c.get(st["risk"], "#333")
+
+    stat_cells = "".join(
+        f'<td align="center" width="14%"><div class="sv" style="color:{col}">'
+        f'{val}</div><div class="sl">{lbl}</div></td>'
+        for val, lbl, col in [
+            (st["domains"], "Domains", "#1a1a24"),
+            (st["hosts"], "Hosts", "#1a1a24"),
+            (st["total_cves"], "Total CVEs", "#1a1a24"),
+            (st["critical"], "Critical", "#C00000"),
+            (st["high"], "High", "#E26B0A"),
+            (st["kev"], "Exploited", "#C00000"),
+            (st["watchlist_hits"], "Watchlist", "#C00000")])
+
+    blocks = ""
+    for d in scan["domains"]:
+        cves = [{**c, "host": h["host"]} for h in d["results"] for c in h["cves"]]
+        vh = d.get("vhosts", [])
+        vh_block = ""
+        if vh:
+            vh_rows = "".join(
+                f'<tr><td>{e(v["ip"])}</td><td>{e(", ".join(v["hosts"][:8]))}'
+                f'{" ..." if len(v["hosts"]) > 8 else ""}</td>'
+                f'<td align="center">{v["count"]}</td></tr>' for v in vh)
+            vh_block = (
+                '<p class="h3">Virtual Hosts (shared IPs)</p>'
+                '<table class="t"><tr><th>IP</th><th>Hostnames</th>'
+                f'<th>Count</th></tr>{vh_rows}</table>')
+        wl_block = ""
+        if d["wl_matches"]:
+            wl_rows = "".join(
+                f'<tr><td>{e(m["id"])}</td><td>{e(m["host"])}</td>'
+                f'<td>{e(m["severity"])}</td><td>{e(m.get("matched_reason",""))}</td>'
+                f'</tr>' for m in d["wl_matches"])
+            wl_block = (
+                '<p class="h3" style="color:#C00000">Day-1 Watchlist Matches</p>'
+                '<table class="t"><tr><th>CVE</th><th>Host</th>'
+                f'<th>Severity</th><th>Match Reason</th></tr>{wl_rows}</table>')
+        rows = ""
+        for c in sorted(cves, key=lambda x: (
+                {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}.get(x["severity"], 3),
+                -x.get("cvss", 0)))[:120]:
+            col = sev_c.get(c["severity"], "#777")
+            kev = " [KEV]" if c.get("known_exploited") else ""
+            rows += (
+                f'<tr><td>{e(c["id"])}</td><td>{e(c["host"])}</td>'
+                f'<td style="color:{col}"><b>{e(c["severity"])}</b></td>'
+                f'<td align="center">{e(c.get("cvss", 0))}</td>'
+                f'<td>{e(c.get("desc", "")[:150])}{kev}</td>'
+                f'<td>{e(c.get("patch", "")[:55])}</td></tr>')
+        cve_block = ""
+        if rows:
+            cve_block = (
+                '<table class="t"><tr><th>CVE ID</th><th>Host</th>'
+                '<th>Severity</th><th>CVSS</th><th>Description</th>'
+                f'<th>Fix</th></tr>{rows}</table>')
+            if len(cves) > 120:
+                cve_block += (f'<p class="note">+ {len(cves)-120} more — '
+                              'see the JSON export for the full list.</p>')
+        blocks += (
+            f'<p class="dh">{e(d["domain"])} &nbsp;&middot;&nbsp; '
+            f'{len(d["results"])} hosts &middot; {len(cves)} CVEs &middot; '
+            f'{d["elapsed"]}</p>{vh_block}{wl_block}{cve_block}')
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+@page {{ size: A4; margin: 1.5cm; }}
+body {{ font-family: Helvetica, Arial, sans-serif; font-size: 8pt; color:#222; }}
+.cover {{ background:#1a1a24; color:#fff; padding:18px; }}
+.cover .k {{ color:#FFE600; font-size:7pt; letter-spacing:2px; }}
+.cover h1 {{ color:#FFE600; font-size:17pt; margin:6px 0; }}
+.cover .m {{ color:#cfcfcf; font-size:8pt; line-height:1.5; }}
+.badge {{ background:{rc}; color:#fff; padding:4px 12px; font-weight:bold;
+  font-size:9pt; }}
+.h2 {{ font-size:11pt; color:#1a1a24; border-left:3px solid #FFE600;
+  padding-left:6px; margin:14px 0 6px; }}
+.h3 {{ font-size:9pt; font-weight:bold; margin:10px 0 4px; }}
+.dh {{ background:#1a1a24; color:#FFE600; padding:5px 8px; font-weight:bold;
+  font-size:9pt; margin:14px 0 4px; }}
+.sv {{ font-size:15pt; font-weight:bold; }}
+.sl {{ font-size:6.5pt; color:#888; text-transform:uppercase; }}
+table.t {{ width:100%; border-collapse:collapse; margin:4px 0; }}
+table.t th {{ background:#1a1a24; color:#FFE600; padding:4px; text-align:left;
+  font-size:7pt; }}
+table.t td {{ padding:3px 4px; border-bottom:1px solid #ddd; font-size:7pt; }}
+.note {{ font-size:7pt; color:#888; }}
+.stat {{ border:1px solid #ddd; }}
+</style></head><body>
+<div class="cover">
+  <div class="k">CVESCAN PRO &mdash; WEB EDITION &mdash; VULNERABILITY ASSESSMENT</div>
+  <h1>Live CVE Scan Report</h1>
+  <div class="m">
+    {"Client: <b>" + e(scan['client']) + "</b><br/>" if scan.get('client') else ""}
+    Targets: <b>{e(', '.join(scan['targets']))}</b><br/>
+    Date: <b>{today}</b><br/>
+    Sources: NVD, OSV, CISA-KEV, GitHub Advisories, Day-1 Watchlist<br/>
+    Watchlist tracked: <b>{scan.get('watchlist_count', 0)}</b>
+  </div>
+  <p><span class="badge">OVERALL RISK: {st['risk']}</span></p>
+</div>
+<p class="h2">Executive Summary</p>
+<table class="stat" width="100%"><tr>{stat_cells}</tr></table>
+<p class="h2">Findings by Domain</p>
+{blocks or '<p>No CVEs matched.</p>'}
+<p class="note" style="margin-top:16px">Generated by CVEScan Pro Web Edition.
+Authorised assessment use only.</p>
+</body></html>"""
 
 
 def build_html_report(scan):
@@ -479,12 +630,27 @@ def build_html_report(scan):
                 <th>CVE</th><th>Host</th><th>Severity</th>
                 <th>Match Reason</th><th>Description</th></tr></thead>
                 <tbody>{wl_rows}</tbody></table></div>"""
+        vh_block = ""
+        if d.get("vhosts"):
+            vh_rows = "".join(f"""<tr>
+              <td style="font-family:monospace">{e(v['ip'])}</td>
+              <td style="font-size:9pt">{e(', '.join(v['hosts']))}</td>
+              <td style="text-align:center">{v['count']}</td>
+            </tr>""" for v in d["vhosts"])
+            vh_block = f"""<div style="background:#f4f6ff;border:1px solid #c9d2ff;
+                border-radius:4px;padding:10px;margin:10px 0">
+              <b style="color:#1a1a24">Virtual Hosts — {len(d['vhosts'])}
+                shared IP(s)</b>
+              <table style="margin-top:8px"><thead><tr>
+                <th>IP</th><th>Hostnames</th><th>Count</th></tr></thead>
+                <tbody>{vh_rows}</tbody></table></div>"""
         domain_blocks += f"""<div style="margin-bottom:24px;border:1px solid #ddd;
             border-radius:6px;overflow:hidden">
           <div style="background:#1a1a24;color:#FFE600;padding:9px 14px;
                font-weight:700">{e(d['domain'])}
             <span style="color:#999;font-weight:400;font-size:9pt">
               &nbsp;{len(cves)} CVEs &middot; {d['elapsed']}</span></div>
+          {vh_block}
           {wl_block}
           <table><thead><tr><th>CVE ID</th><th>Host</th><th>Severity</th>
             <th>CVSS</th><th>Description</th><th>Affected</th><th>Fix</th>
