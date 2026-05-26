@@ -1,379 +1,723 @@
 #!/usr/bin/env python3
 """
-CVEScan Pro - Web Edition :: ai.py
-Multi-provider AI layer. Adds AI analysis on top of the raw scan data.
+CVEScan Pro — Web Edition :: app.py
+Flask backend. Hosts the dashboard, runs scans/watchlist syncs as background
+jobs, and exposes the AI endpoints.
 
-Supported providers (use whichever API key you have):
-  * gemini     - Google Gemini
-  * openai     - OpenAI (GPT)
-  * anthropic  - Anthropic (Claude)
-  * groq       - Groq (fast Llama inference)
-
-All API keys are read from environment variables - NEVER hard-coded.
-The active provider is chosen by AI_PROVIDER, or auto-selected from
-whichever key is present. It can also be switched at runtime from the UI.
-
-Capabilities (provider-agnostic):
-  explain_cve(), executive_summary(), triage_findings(), ask()
+Run locally:   python app.py
+Run hosted:    gunicorn app:app --workers 1 --threads 8 --timeout 120
 """
 
-import os, json
+import os, json, uuid, time, threading, datetime, html
+from pathlib import Path
 
-try:
-    import requests
-    HAS_REQUESTS = True
-except ImportError:
-    HAS_REQUESTS = False
+from dotenv import load_dotenv
+load_dotenv()                       # load .env before importing our modules
+
+from flask import (Flask, request, jsonify, render_template,
+                   Response, abort)
+
+import scanner
+import ai
+
+app = Flask(__name__)
+BASE_DIR = Path(__file__).resolve().parent
+
+# ════════════════════════════════════════════════════════════════
+# JOB MANAGER  — simple in-memory background job store
+# ════════════════════════════════════════════════════════════════
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+MAX_JOBS = 50          # keep memory bounded
+
+
+def _new_job(job_type):
+    jid = uuid.uuid4().hex[:12]
+    job = {
+        "id": jid, "type": job_type, "status": "queued",
+        "progress": 0, "log": [], "result": None, "error": None,
+        "created": datetime.datetime.now().isoformat(),
+        "label": "",
+    }
+    with JOBS_LOCK:
+        JOBS[jid] = job
+        # evict oldest finished jobs if over the cap
+        if len(JOBS) > MAX_JOBS:
+            done = sorted((j for j in JOBS.values()
+                           if j["status"] in ("done", "error")),
+                          key=lambda j: j["created"])
+            for old in done[:len(JOBS) - MAX_JOBS]:
+                JOBS.pop(old["id"], None)
+    return job
+
+
+def _run_job(job, target_fn):
+    """Wrap a job: wire up logging/progress callbacks, run, capture result."""
+    def log(level, msg):
+        line = {"t": time.strftime("%H:%M:%S"), "level": level, "msg": str(msg)}
+        job["log"].append(line)
+        if len(job["log"]) > 1200:        # cap log size
+            del job["log"][:400]
+
+    def progress(pct):
+        job["progress"] = max(0, min(100, int(pct)))
+
+    scanner.set_logger(log)
+    scanner.set_progress_cb(progress)
+    job["status"] = "running"
+    try:
+        job["result"] = target_fn(log, progress)
+        job["status"] = "done"
+        job["progress"] = 100
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+        log("bad", f"Job failed: {e}")
+
+
+def _start(job, target_fn):
+    threading.Thread(target=_run_job, args=(job, target_fn), daemon=True).start()
 
 
 # ════════════════════════════════════════════════════════════════
-# PROVIDER REGISTRY
+# SCAN PIPELINE
 # ════════════════════════════════════════════════════════════════
-def _env(name, default=""):
-    return os.environ.get(name, default).strip()
+def _scan_pipeline(targets, full, client, force_sync):
+    """Runs inside a job thread. Returns the full scan result dict."""
+    merged_db, cisa_map, watchlist_db = scanner.sync_all_cves(force=force_sync)
 
-PROVIDERS = {
-    "gemini": {
-        "label": "Google Gemini",
-        "key": _env("GEMINI_API_KEY"),
-        "model": _env("GEMINI_MODEL", "gemini-2.0-flash"),
-    },
-    "openai": {
-        "label": "OpenAI (GPT)",
-        "key": _env("OPENAI_API_KEY"),
-        "model": _env("OPENAI_MODEL", "gpt-4.1-mini"),
-    },
-    "anthropic": {
-        "label": "Anthropic (Claude)",
-        "key": _env("ANTHROPIC_API_KEY"),
-        "model": _env("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
-    },
-    "groq": {
-        "label": "Groq (Llama)",
-        "key": _env("GROQ_API_KEY"),
-        "model": _env("GROQ_MODEL", "llama-3.3-70b-versatile"),
-    },
-}
+    domains = []
+    for i, raw in enumerate(targets):
+        dc = scanner.clean_domain(raw)
+        if not dc:
+            scanner.warn(f"Skipping invalid target: {raw}")
+            continue
+        scanner.hdr(f"[{i+1}/{len(targets)}] TARGET: {dc}")
+        t0 = time.time()
+        results = scanner.run_domain_scan(dc, merged_db, full=full)
 
-# auto-selection priority when AI_PROVIDER is not set
-_PRIORITY = ["gemini", "openai", "anthropic", "groq"]
+        scanner.hdr("DAY-1 WATCHLIST CROSS-REFERENCE")
+        wl_matches = scanner.cross_reference_watchlist(results, watchlist_db, cisa_map)
+        if wl_matches:
+            scanner.warn(f"{len(wl_matches)} watchlist CVEs matched detected tech!")
+        else:
+            scanner.good("No watchlist CVEs matched detected tech on this domain")
 
-# runtime override (set from the UI); falls back to env / auto
-_OVERRIDE = None
+        domains.append({
+            "domain": dc, "results": results,
+            "wl_matches": wl_matches,
+            "vhosts": scanner.group_virtual_hosts(results),
+            "elapsed": f"{time.time() - t0:.1f}s",
+        })
 
-
-def configured_providers():
-    """List of provider names that have an API key set."""
-    return [p for p in _PRIORITY if PROVIDERS[p]["key"]]
-
-
-def active_provider():
-    """Resolve which provider to use right now."""
-    if _OVERRIDE and PROVIDERS.get(_OVERRIDE, {}).get("key"):
-        return _OVERRIDE
-    env_choice = _env("AI_PROVIDER").lower()
-    if env_choice in PROVIDERS and PROVIDERS[env_choice]["key"]:
-        return env_choice
-    avail = configured_providers()
-    return avail[0] if avail else None
-
-
-def set_provider(name):
-    """Switch the active provider at runtime. Returns True on success."""
-    global _OVERRIDE
-    if name in PROVIDERS and PROVIDERS[name]["key"]:
-        _OVERRIDE = name
-        return True
-    return False
-
-
-def ai_available():
-    """True if at least one provider is usable."""
-    return HAS_REQUESTS and active_provider() is not None
-
-
-def ai_status():
-    """Full status: active provider, model, and per-provider availability."""
-    active = active_provider()
     return {
-        "available": ai_available(),
-        "active": active,
-        "active_label": PROVIDERS[active]["label"] if active else None,
-        "model": PROVIDERS[active]["model"] if active else None,
-        "requests_lib": HAS_REQUESTS,
-        "providers": {
-            name: {
-                "label": p["label"],
-                "configured": bool(p["key"]),
-                "model": p["model"],
-            } for name, p in PROVIDERS.items()
-        },
+        "targets": [scanner.clean_domain(t) for t in targets
+                    if scanner.clean_domain(t)],
+        "client": client,
+        "full": full,
+        "domains": domains,
+        "watchlist_count": len(watchlist_db),
+        "watchlist_pending": sum(1 for v in watchlist_db.values()
+                                 if v.get("pending")),
+        "generated": datetime.datetime.now().isoformat(),
+        "stats": _scan_stats(domains),
     }
 
 
-# ════════════════════════════════════════════════════════════════
-# LOW-LEVEL PROVIDER CALLS
-# ════════════════════════════════════════════════════════════════
-def _call_gemini(key, model, prompt, temperature, max_tokens):
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{model}:generateContent")
-    r = requests.post(
-        url,
-        headers={"Content-Type": "application/json", "x-goog-api-key": key},
-        json={
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": temperature,
-                                 "maxOutputTokens": max_tokens},
-        }, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(_err("Gemini", r))
-    data = r.json()
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts).strip()
-    except (KeyError, IndexError):
-        reason = (data.get("candidates", [{}])[0].get("finishReason")
-                  or data.get("promptFeedback", {}).get("blockReason")
-                  or "no content")
-        raise RuntimeError(f"Gemini returned no usable text ({reason}).")
-
-
-def _call_anthropic(key, model, prompt, temperature, max_tokens):
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"},
-        json={"model": model, "max_tokens": max_tokens,
-              "temperature": temperature,
-              "messages": [{"role": "user", "content": prompt}]},
-        timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(_err("Claude", r))
-    data = r.json()
-    text = "".join(b.get("text", "") for b in data.get("content", [])
-                   if b.get("type") == "text").strip()
-    if not text:
-        raise RuntimeError("Claude returned no usable text "
-                            f"({data.get('stop_reason', 'unknown')}).")
-    return text
-
-
-def _call_openai_compatible(label, base_url, key, model,
-                            prompt, temperature, max_tokens):
-    """Used for both OpenAI and Groq (Groq is OpenAI-API-compatible)."""
-    headers = {"Authorization": f"Bearer {key}",
-               "Content-Type": "application/json"}
-    body = {"model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature, "max_tokens": max_tokens}
-    r = requests.post(base_url, headers=headers, json=body, timeout=60)
-
-    # some newer models reject temperature / max_tokens - retry minimal
-    if r.status_code == 400:
-        msg = ""
-        try:
-            msg = r.json().get("error", {}).get("message", "")
-        except Exception:
-            pass
-        if any(k in msg for k in ("max_tokens", "max_completion_tokens",
-                                  "temperature", "unsupported")):
-            r = requests.post(base_url, headers=headers, json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_completion_tokens": max_tokens,
-            }, timeout=60)
-
-    if r.status_code != 200:
-        raise RuntimeError(_err(label, r))
-    data = r.json()
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError):
-        raise RuntimeError(f"{label} returned no usable text.")
-
-
-def _err(label, resp):
-    detail = ""
-    try:
-        j = resp.json()
-        detail = (j.get("error", {}).get("message")
-                  or j.get("error", {}).get("type") or "")
-    except Exception:
-        detail = resp.text[:200]
-    return f"{label} API error {resp.status_code}: {detail}"
-
-
-# ════════════════════════════════════════════════════════════════
-# DISPATCH
-# ════════════════════════════════════════════════════════════════
-def _call(prompt, temperature=0.3, max_tokens=2048):
-    """Send a prompt to the active provider. Returns text or raises."""
-    if not HAS_REQUESTS:
-        raise RuntimeError("The 'requests' library is not installed.")
-    name = active_provider()
-    if not name:
-        raise RuntimeError("No AI provider configured. Set one of "
-                           "GEMINI_API_KEY / OPENAI_API_KEY / "
-                           "ANTHROPIC_API_KEY / GROQ_API_KEY.")
-    p = PROVIDERS[name]
-    key, model = p["key"], p["model"]
-    try:
-        if name == "gemini":
-            return _call_gemini(key, model, prompt, temperature, max_tokens)
-        if name == "anthropic":
-            return _call_anthropic(key, model, prompt, temperature, max_tokens)
-        if name == "openai":
-            return _call_openai_compatible(
-                "OpenAI", "https://api.openai.com/v1/chat/completions",
-                key, model, prompt, temperature, max_tokens)
-        if name == "groq":
-            return _call_openai_compatible(
-                "Groq", "https://api.groq.com/openai/v1/chat/completions",
-                key, model, prompt, temperature, max_tokens)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Could not reach the {p['label']} API: {e}")
-    raise RuntimeError(f"Unknown provider: {name}")
-
-
-def _call_json(prompt, temperature=0.2):
-    """Call the active provider and parse a JSON object from the reply."""
-    raw = _call(prompt, temperature=temperature)
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned[3:]
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-        if "```" in cleaned:
-            cleaned = cleaned[:cleaned.rfind("```")]
-    cleaned = cleaned.strip().strip("`").strip()
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start != -1 and end != -1:
-        cleaned = cleaned[start:end + 1]
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        return {"_raw": raw}
-
-
-# ════════════════════════════════════════════════════════════════
-# CAPABILITY 1 - explain a single CVE
-# ════════════════════════════════════════════════════════════════
-def explain_cve(cve):
-    """Plain-English risk explanation + patch-priority verdict for one CVE."""
-    kev = cve.get("known_exploited")
-    prompt = f"""You are a senior security analyst writing for a client report.
-Explain this CVE clearly and concisely for a technical-but-busy IT manager.
-
-CVE ID: {cve.get('id')}
-Severity: {cve.get('severity')}   CVSS: {cve.get('cvss')}
-Affected: {cve.get('affected_product') or cve.get('matched_keyword') or 'unknown'}
-Actively exploited (CISA KEV): {"YES" if kev else "no"}
-Description: {cve.get('desc', '')}
-
-Return ONLY a JSON object with these keys:
-  "summary"      : 2-3 sentence plain-English explanation of the vulnerability
-  "attack"       : 1-2 sentences on how an attacker would realistically abuse it
-  "verdict"      : one of "PATCH TODAY", "PATCH THIS WEEK", "SCHEDULE", "MONITOR"
-  "verdict_why"  : 1 sentence justifying the verdict
-  "remediation"  : a short actionable fix recommendation (1-2 sentences)
-No markdown, no backticks, just the JSON object."""
-    result = _call_json(prompt)
-    result["cve_id"] = cve.get("id")
-    return result
-
-
-# ════════════════════════════════════════════════════════════════
-# CAPABILITY 2 - executive summary of a whole scan
-# ════════════════════════════════════════════════════════════════
-def _scan_digest(scan):
-    """Compress a scan result into a compact text digest for the prompt."""
-    lines = [f"Targets: {', '.join(scan.get('targets', []))}"]
-    domains = scan.get("domains", [])
-    all_cves = []
+def _scan_stats(domains):
+    all_cves, hosts, wl_hits, vhosts = [], 0, 0, 0
     for d in domains:
-        for host in d.get("results", []):
-            for c in host.get("cves", []):
-                all_cves.append(c)
-        lines.append(f"  Domain {d.get('domain')}: "
-                      f"{len(d.get('results', []))} hosts, "
-                      f"{sum(len(h.get('cves', [])) for h in d.get('results', []))} CVEs, "
-                      f"{len(d.get('wl_matches', []))} watchlist hits")
-    sev = {}
-    for c in all_cves:
-        sev[c["severity"]] = sev.get(c["severity"], 0) + 1
+        hosts += len(d["results"])
+        wl_hits += len(d["wl_matches"])
+        vhosts += len(d.get("vhosts", []))
+        for h in d["results"]:
+            all_cves.extend(h["cves"])
+    crit = sum(1 for c in all_cves if c["severity"] == "CRITICAL")
+    high = sum(1 for c in all_cves if c["severity"] == "HIGH")
+    med = sum(1 for c in all_cves if c["severity"] == "MEDIUM")
     kev = sum(1 for c in all_cves if c.get("known_exploited"))
-    lines.append(f"Severity spread: {sev}")
-    lines.append(f"Actively exploited (KEV): {kev}")
-    top = sorted(all_cves, key=lambda x: (
-        {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}.get(x["severity"], 3),
-        -x.get("cvss", 0)))[:15]
-    lines.append("Top findings:")
-    for c in top:
-        lines.append(f"  {c['id']} [{c['severity']} {c.get('cvss')}] "
-                     f"{c.get('desc', '')[:110]}")
-    return "\n".join(lines)
-
-
-def executive_summary(scan):
-    """Generate a board-level executive summary of the scan."""
-    digest = _scan_digest(scan)
-    prompt = f"""You are a lead penetration tester writing the Executive Summary
-section of a vulnerability assessment report for senior management.
-
-SCAN DATA:
-{digest}
-
-Write a concise executive summary. Return ONLY a JSON object with keys:
-  "overall_risk"  : one of "CRITICAL", "HIGH", "MEDIUM", "LOW"
-  "headline"      : one punchy sentence describing the security posture
-  "summary"       : 3-5 sentences of plain-English assessment for executives
-  "key_risks"     : array of 3-5 short strings, the most important risks
-  "priorities"    : array of 3-5 short strings, recommended actions in priority order
-No markdown, no backticks, just the JSON object."""
-    return _call_json(prompt)
+    risk = ("CRITICAL" if crit else "HIGH" if high
+            else "MEDIUM" if med else "LOW")
+    return {"domains": len(domains), "hosts": hosts, "total_cves": len(all_cves),
+            "critical": crit, "high": high, "medium": med, "kev": kev,
+            "watchlist_hits": wl_hits, "shared_ips": vhosts, "risk": risk}
 
 
 # ════════════════════════════════════════════════════════════════
-# CAPABILITY 3 - remediation triage
+# ROUTES — pages
 # ════════════════════════════════════════════════════════════════
-def triage_findings(cves, limit=25):
-    """Produce a prioritised remediation plan from a list of CVEs."""
-    subset = sorted(cves, key=lambda x: (
-        {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}.get(x["severity"], 3),
-        -x.get("cvss", 0)))[:limit]
-    listing = "\n".join(
-        f"- {c['id']} [{c['severity']} CVSS {c.get('cvss')}] "
-        f"host={c.get('host', '?')} kev={bool(c.get('known_exploited'))} "
-        f"product={c.get('affected_product') or c.get('matched_keyword') or '?'}"
-        for c in subset)
-    prompt = f"""You are a security remediation lead. Given these scan findings,
-build a prioritised remediation plan grouped into time-based waves.
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-FINDINGS:
-{listing}
 
-Return ONLY a JSON object with key "waves" = array of objects, each:
-  "wave"   : e.g. "Immediate (24-48h)", "This week", "This month"
-  "rationale" : 1 sentence on why these belong in this wave
-  "items"  : array of objects {{"cve": "...", "action": "short fix action"}}
-No markdown, no backticks, just the JSON object."""
-    return _call_json(prompt)
+@app.route("/api/status")
+def api_status():
+    meta = scanner.load_meta()
+    db = scanner.load_cve_cache()
+    wl_ids = scanner.load_watchlist_ids()
+    wl_cache = scanner.load_watchlist_cache()
+    sources = {}
+    for src in ["nvd", "osv", "cisa", "github"]:
+        last = meta.get(f"last_{src}", 0)
+        age = int((time.time() - last) / 60) if last else None
+        sources[src] = {"entries": len(db.get(src, {})), "age_min": age}
+    wl_last = meta.get("last_watchlist", 0)
+    return jsonify({
+        "sources": sources,
+        "watchlist": {
+            "tracked": len(wl_ids),
+            "indexed": sum(1 for c in wl_ids
+                           if c in wl_cache and not wl_cache[c].get("pending")),
+            "pending": sum(1 for c in wl_ids
+                           if c in wl_cache and wl_cache[c].get("pending")),
+            "age_min": int((time.time() - wl_last) / 60) if wl_last else None,
+        },
+        "ai": ai.ai_status(),
+        "nvd_key": bool(scanner.NVD_API_KEY),
+    })
 
 
 # ════════════════════════════════════════════════════════════════
-# CAPABILITY 4 - free-form Q&A
+# ROUTES — watchlist (the automated Day-1 CVE list)
 # ════════════════════════════════════════════════════════════════
-def ask(question, scan):
-    """Answer a free-form question grounded in the scan data."""
-    digest = _scan_digest(scan)
-    prompt = f"""You are a security analyst assistant. Answer the user's question
-using ONLY the scan data below. If the data does not contain the answer, say so.
-Be concise and practical. Plain text, no markdown headers.
+@app.route("/api/watchlist")
+def watchlist_get():
+    ids = scanner.load_watchlist_ids()
+    cache = scanner.load_watchlist_cache()
+    items = []
+    for cid in ids:
+        c = cache.get(cid)
+        if c:
+            items.append({
+                "id": cid, "severity": c.get("severity", "UNKNOWN"),
+                "cvss": c.get("cvss", 0), "desc": c.get("desc", ""),
+                "published": c.get("published", "?"),
+                "source": c.get("source", "?"),
+                "pending": bool(c.get("pending")),
+                "affected_product": c.get("affected_product", ""),
+                "patch": c.get("patch", ""),
+            })
+        else:
+            items.append({"id": cid, "severity": "UNKNOWN", "cvss": 0,
+                           "desc": "Not yet synced", "pending": True,
+                           "source": "-", "published": "-",
+                           "affected_product": "", "patch": ""})
+    items.sort(key=lambda x: (
+        {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3,
+         "UNKNOWN": 4}.get(x["severity"], 4), -x.get("cvss", 0)))
+    return jsonify({"count": len(ids), "items": items})
 
-SCAN DATA:
-{digest}
 
-USER QUESTION: {question}
+@app.route("/api/watchlist/import", methods=["POST"])
+def watchlist_import():
+    """Import CVE IDs from pasted text OR an uploaded file. Merges into list."""
+    text = ""
+    if "file" in request.files:
+        text += request.files["file"].read().decode("utf-8", errors="ignore")
+    if request.is_json:
+        text += "\n" + ((request.json or {}).get("text", ""))
+    else:
+        text += "\n" + request.form.get("text", "")
 
-ANSWER:"""
-    return _call(prompt, temperature=0.4, max_tokens=1024)
+    found = scanner.extract_cve_ids(text)
+    if not found:
+        return jsonify({"ok": False,
+                        "error": "No valid CVE IDs found in the input."}), 400
+    merged, newly_added = scanner.add_watchlist_ids(text)
+    return jsonify({"ok": True, "imported": len(newly_added),
+                    "found": len(found), "total": len(merged),
+                    "new_ids": newly_added,
+                    "note": ("All supplied CVEs were already tracked."
+                             if not newly_added else "")})
+
+
+@app.route("/api/watchlist/replace", methods=["POST"])
+def watchlist_replace():
+    """Replace the entire watchlist with a new set of CVE IDs."""
+    data = request.get_json(silent=True) or {}
+    ids = scanner.extract_cve_ids(data.get("text", ""))
+    clean = scanner.save_watchlist_ids(ids)
+    return jsonify({"ok": True, "total": len(clean)})
+
+
+@app.route("/api/watchlist/clear", methods=["POST"])
+def watchlist_clear():
+    scanner.save_watchlist_ids([])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/watchlist/sync", methods=["POST"])
+def watchlist_sync():
+    """Kick off a background watchlist sync (fetch each CVE by ID)."""
+    if not scanner.load_watchlist_ids():
+        return jsonify({"ok": False, "error": "Watchlist is empty."}), 400
+    force = bool((request.get_json(silent=True) or {}).get("force"))
+    job = _new_job("watchlist")
+    job["label"] = "Watchlist sync"
+
+    def task(log, progress):
+        wl = scanner.sync_watchlist(force=force)
+        return {"synced": len(wl)}
+
+    _start(job, task)
+    return jsonify({"ok": True, "job_id": job["id"]})
+
+
+# ════════════════════════════════════════════════════════════════
+# ROUTES — scanning
+# ════════════════════════════════════════════════════════════════
+@app.route("/api/scan", methods=["POST"])
+def scan_start():
+    data = request.get_json(silent=True) or {}
+    raw = data.get("targets", "")
+    targets = [t for t in
+               (scanner.clean_domain(x) for x in
+                __import__("re").split(r"[,\s]+", raw))
+               if t]
+    if not targets:
+        return jsonify({"ok": False, "error": "No valid domains given."}), 400
+    full = bool(data.get("full"))
+    client = (data.get("client") or "").strip()
+    force_sync = bool(data.get("force_sync"))
+
+    job = _new_job("scan")
+    job["label"] = f"Scan: {', '.join(targets[:3])}" + (
+        f" +{len(targets)-3}" if len(targets) > 3 else "")
+
+    def task(log, progress):
+        return _scan_pipeline(targets, full, client, force_sync)
+
+    _start(job, task)
+    return jsonify({"ok": True, "job_id": job["id"], "targets": targets})
+
+
+@app.route("/api/job/<jid>")
+def job_status(jid):
+    job = JOBS.get(jid)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    # send only the tail of the log unless explicitly asked for all
+    since = int(request.args.get("since", 0))
+    log_slice = job["log"][since:]
+    return jsonify({
+        "id": job["id"], "type": job["type"], "status": job["status"],
+        "progress": job["progress"], "label": job["label"],
+        "error": job["error"], "log": log_slice, "log_total": len(job["log"]),
+        "result": job["result"] if job["status"] == "done" else None,
+    })
+
+
+@app.route("/api/jobs")
+def jobs_list():
+    with JOBS_LOCK:
+        items = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)
+    return jsonify([{"id": j["id"], "type": j["type"], "status": j["status"],
+                     "label": j["label"], "progress": j["progress"],
+                     "created": j["created"]} for j in items[:20]])
+
+
+# ════════════════════════════════════════════════════════════════
+# ROUTES — AI (Gemini)
+# ════════════════════════════════════════════════════════════════
+@app.route("/api/ai/status")
+def ai_status_route():
+    return jsonify(ai.ai_status())
+
+
+@app.route("/api/ai/provider", methods=["POST"])
+def ai_set_provider():
+    """Switch the active AI provider at runtime (must have a key configured)."""
+    name = (request.get_json(silent=True) or {}).get("provider", "")
+    if ai.set_provider(name):
+        return jsonify({"ok": True, "status": ai.ai_status()})
+    return jsonify({"ok": False,
+                    "error": f"Provider '{name}' has no API key configured."}), 400
+
+
+def _job_result_or_404(jid):
+    job = JOBS.get(jid)
+    if not job or job["status"] != "done" or not job["result"]:
+        abort(404)
+    return job["result"]
+
+
+def _all_cves(scan):
+    out = []
+    for d in scan.get("domains", []):
+        for h in d.get("results", []):
+            for c in h.get("cves", []):
+                out.append({**c, "host": h["host"]})
+    return out
+
+
+@app.route("/api/ai/explain", methods=["POST"])
+def ai_explain():
+    if not ai.ai_available():
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
+    cve = (request.get_json(silent=True) or {}).get("cve")
+    if not cve or not cve.get("id"):
+        return jsonify({"ok": False, "error": "No CVE supplied."}), 400
+    try:
+        return jsonify({"ok": True, "result": ai.explain_cve(cve)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.route("/api/ai/summary", methods=["POST"])
+def ai_summary():
+    if not ai.ai_available():
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
+    jid = (request.get_json(silent=True) or {}).get("job_id")
+    scan = _job_result_or_404(jid)
+    try:
+        return jsonify({"ok": True, "result": ai.executive_summary(scan)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.route("/api/ai/triage", methods=["POST"])
+def ai_triage():
+    if not ai.ai_available():
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
+    jid = (request.get_json(silent=True) or {}).get("job_id")
+    scan = _job_result_or_404(jid)
+    cves = _all_cves(scan)
+    if not cves:
+        return jsonify({"ok": False, "error": "No CVEs to triage."}), 400
+    try:
+        return jsonify({"ok": True, "result": ai.triage_findings(cves)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.route("/api/ai/deep", methods=["POST"])
+def ai_deep():
+    """AI deep analysis — fingerprint correlation + exploitability assessment."""
+    if not ai.ai_available():
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
+    jid = (request.get_json(silent=True) or {}).get("job_id")
+    scan = _job_result_or_404(jid)
+    try:
+        return jsonify({"ok": True, "result": ai.deep_analysis(scan)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.route("/api/ai/ask", methods=["POST"])
+def ai_ask():
+    if not ai.ai_available():
+        return jsonify({"ok": False, "error": "AI not configured."}), 400
+    data = request.get_json(silent=True) or {}
+    scan = _job_result_or_404(data.get("job_id"))
+    question = (data.get("question") or "").strip()
+    if not question:
+        return jsonify({"ok": False, "error": "No question supplied."}), 400
+    try:
+        return jsonify({"ok": True, "answer": ai.ask(question, scan)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+# ════════════════════════════════════════════════════════════════
+# ROUTES — report download
+# ════════════════════════════════════════════════════════════════
+@app.route("/api/report/<jid>")
+def report(jid):
+    scan = _job_result_or_404(jid)
+    fmt = request.args.get("fmt", "html")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if fmt == "json":
+        return Response(
+            json.dumps(scan, indent=2),
+            mimetype="application/json",
+            headers={"Content-Disposition":
+                     f"attachment; filename=CVEScan_{ts}.json"})
+    if fmt == "pdf":
+        try:
+            pdf_bytes = build_pdf_report(scan)
+        except Exception as e:
+            return jsonify({"error": f"PDF generation failed: {e}"}), 500
+        return Response(
+            pdf_bytes, mimetype="application/pdf",
+            headers={"Content-Disposition":
+                     f"attachment; filename=CVEScan_{ts}.pdf"})
+    html_doc = build_html_report(scan)
+    return Response(html_doc, mimetype="text/html",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=CVEScan_{ts}.html"})
+
+
+def build_pdf_report(scan):
+    """Render the scan as a PDF (via xhtml2pdf — pure Python, no system libs)."""
+    from io import BytesIO
+    from xhtml2pdf import pisa
+    src = build_pdf_html(scan)
+    buf = BytesIO()
+    result = pisa.CreatePDF(src, dest=buf, encoding="utf-8")
+    if result.err:
+        raise RuntimeError("xhtml2pdf reported a rendering error")
+    return buf.getvalue()
+
+
+def build_pdf_html(scan):
+    """A simplified, xhtml2pdf-friendly HTML (table layout, no flex/gradient)."""
+    e = lambda s: html.escape(str(s))
+    sev_c = {"CRITICAL": "#C00000", "HIGH": "#E26B0A",
+             "MEDIUM": "#B8860B", "LOW": "#2E7D32", "UNKNOWN": "#777"}
+    st = scan["stats"]
+    today = datetime.date.today().strftime("%d %B %Y")
+    rc = sev_c.get(st["risk"], "#333")
+
+    stat_cells = "".join(
+        f'<td align="center" width="14%"><div class="sv" style="color:{col}">'
+        f'{val}</div><div class="sl">{lbl}</div></td>'
+        for val, lbl, col in [
+            (st["domains"], "Domains", "#1a1a24"),
+            (st["hosts"], "Hosts", "#1a1a24"),
+            (st["total_cves"], "Total CVEs", "#1a1a24"),
+            (st["critical"], "Critical", "#C00000"),
+            (st["high"], "High", "#E26B0A"),
+            (st["kev"], "Exploited", "#C00000"),
+            (st["watchlist_hits"], "Watchlist", "#C00000")])
+
+    blocks = ""
+    for d in scan["domains"]:
+        cves = [{**c, "host": h["host"]} for h in d["results"] for c in h["cves"]]
+        vh = d.get("vhosts", [])
+        vh_block = ""
+        if vh:
+            vh_rows = "".join(
+                f'<tr><td>{e(v["ip"])}</td><td>{e(", ".join(v["hosts"][:8]))}'
+                f'{" ..." if len(v["hosts"]) > 8 else ""}</td>'
+                f'<td align="center">{v["count"]}</td></tr>' for v in vh)
+            vh_block = (
+                '<p class="h3">Virtual Hosts (shared IPs)</p>'
+                '<table class="t"><tr><th>IP</th><th>Hostnames</th>'
+                f'<th>Count</th></tr>{vh_rows}</table>')
+        wl_block = ""
+        if d["wl_matches"]:
+            wl_rows = "".join(
+                f'<tr><td>{e(m["id"])}</td><td>{e(m["host"])}</td>'
+                f'<td>{e(m["severity"])}</td><td>{e(m.get("matched_reason",""))}</td>'
+                f'</tr>' for m in d["wl_matches"])
+            wl_block = (
+                '<p class="h3" style="color:#C00000">Day-1 Watchlist Matches</p>'
+                '<table class="t"><tr><th>CVE</th><th>Host</th>'
+                f'<th>Severity</th><th>Match Reason</th></tr>{wl_rows}</table>')
+        rows = ""
+        for c in sorted(cves, key=lambda x: (
+                {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}.get(x["severity"], 3),
+                -x.get("cvss", 0)))[:120]:
+            col = sev_c.get(c["severity"], "#777")
+            kev = " [KEV]" if c.get("known_exploited") else ""
+            rows += (
+                f'<tr><td>{e(c["id"])}</td><td>{e(c["host"])}</td>'
+                f'<td style="color:{col}"><b>{e(c["severity"])}</b></td>'
+                f'<td align="center">{e(c.get("cvss", 0))}</td>'
+                f'<td>{e(c.get("desc", "")[:150])}{kev}</td>'
+                f'<td>{e(c.get("patch", "")[:55])}</td></tr>')
+        cve_block = ""
+        if rows:
+            cve_block = (
+                '<table class="t"><tr><th>CVE ID</th><th>Host</th>'
+                '<th>Severity</th><th>CVSS</th><th>Description</th>'
+                f'<th>Fix</th></tr>{rows}</table>')
+            if len(cves) > 120:
+                cve_block += (f'<p class="note">+ {len(cves)-120} more — '
+                              'see the JSON export for the full list.</p>')
+        blocks += (
+            f'<p class="dh">{e(d["domain"])} &nbsp;&middot;&nbsp; '
+            f'{len(d["results"])} hosts &middot; {len(cves)} CVEs &middot; '
+            f'{d["elapsed"]}</p>{vh_block}{wl_block}{cve_block}')
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+@page {{ size: A4; margin: 1.5cm; }}
+body {{ font-family: Helvetica, Arial, sans-serif; font-size: 8pt; color:#222; }}
+.cover {{ background:#1a1a24; color:#fff; padding:18px; }}
+.cover .k {{ color:#FFE600; font-size:7pt; letter-spacing:2px; }}
+.cover h1 {{ color:#FFE600; font-size:17pt; margin:6px 0; }}
+.cover .m {{ color:#cfcfcf; font-size:8pt; line-height:1.5; }}
+.badge {{ background:{rc}; color:#fff; padding:4px 12px; font-weight:bold;
+  font-size:9pt; }}
+.h2 {{ font-size:11pt; color:#1a1a24; border-left:3px solid #FFE600;
+  padding-left:6px; margin:14px 0 6px; }}
+.h3 {{ font-size:9pt; font-weight:bold; margin:10px 0 4px; }}
+.dh {{ background:#1a1a24; color:#FFE600; padding:5px 8px; font-weight:bold;
+  font-size:9pt; margin:14px 0 4px; }}
+.sv {{ font-size:15pt; font-weight:bold; }}
+.sl {{ font-size:6.5pt; color:#888; text-transform:uppercase; }}
+table.t {{ width:100%; border-collapse:collapse; margin:4px 0; }}
+table.t th {{ background:#1a1a24; color:#FFE600; padding:4px; text-align:left;
+  font-size:7pt; }}
+table.t td {{ padding:3px 4px; border-bottom:1px solid #ddd; font-size:7pt; }}
+.note {{ font-size:7pt; color:#888; }}
+.stat {{ border:1px solid #ddd; }}
+</style></head><body>
+<div class="cover">
+  <div class="k">CVESCAN PRO &mdash; WEB EDITION &mdash; VULNERABILITY ASSESSMENT</div>
+  <h1>Live CVE Scan Report</h1>
+  <div class="m">
+    {"Client: <b>" + e(scan['client']) + "</b><br/>" if scan.get('client') else ""}
+    Targets: <b>{e(', '.join(scan['targets']))}</b><br/>
+    Date: <b>{today}</b><br/>
+    Sources: NVD, OSV, CISA-KEV, GitHub Advisories, Day-1 Watchlist<br/>
+    Watchlist tracked: <b>{scan.get('watchlist_count', 0)}</b>
+  </div>
+  <p><span class="badge">OVERALL RISK: {st['risk']}</span></p>
+</div>
+<p class="h2">Executive Summary</p>
+<table class="stat" width="100%"><tr>{stat_cells}</tr></table>
+<p class="h2">Findings by Domain</p>
+{blocks or '<p>No CVEs matched.</p>'}
+<p class="note" style="margin-top:16px">Generated by CVEScan Pro Web Edition.
+Authorised assessment use only.</p>
+</body></html>"""
+
+
+def build_html_report(scan):
+    """Self-contained HTML report (open in browser, Ctrl+P for PDF)."""
+    e = lambda s: html.escape(str(s))
+    sev_c = {"CRITICAL": "#C00000", "HIGH": "#E26B0A",
+             "MEDIUM": "#B8860B", "LOW": "#2E7D32", "UNKNOWN": "#777"}
+    st = scan["stats"]
+    today = datetime.date.today().strftime("%d %B %Y")
+    rc = sev_c.get(st["risk"], "#333")
+
+    domain_blocks = ""
+    for d in scan["domains"]:
+        cves = [{**c, "host": h["host"], "ip": h["ip"]}
+                for h in d["results"] for c in h["cves"]]
+        if not cves and not d["wl_matches"]:
+            continue
+        rows = ""
+        for c in sorted(cves, key=lambda x: (
+                {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}.get(x["severity"], 3),
+                -x.get("cvss", 0))):
+            col = sev_c.get(c["severity"], "#777")
+            kev = (' <b style="color:#C00000">[KEV]</b>'
+                   if c.get("known_exploited") else "")
+            rows += f"""<tr>
+              <td style="font-family:monospace;color:#1565C0;font-weight:700">
+                <a href="https://nvd.nist.gov/vuln/detail/{e(c['id'])}"
+                   style="color:#1565C0">{e(c['id'])}</a></td>
+              <td>{e(c['host'])}</td>
+              <td><span style="color:{col};border:1.5px solid {col};
+                  border-radius:3px;padding:1px 7px;font-weight:700;
+                  font-size:8.5pt">{e(c['severity'])}</span></td>
+              <td style="color:{col};font-weight:700;text-align:center">
+                {e(c.get('cvss', 0))}</td>
+              <td style="font-size:9pt">{e(c.get('desc', '')[:170])}{kev}</td>
+              <td style="font-size:9pt;color:#444">
+                {e((c.get('affected_product') or c.get('matched_keyword') or '-').title())}</td>
+              <td style="color:#2E7D32;font-size:9pt">{e(c.get('patch', '')[:70])}</td>
+            </tr>"""
+        wl_block = ""
+        if d["wl_matches"]:
+            wl_rows = "".join(f"""<tr style="background:#fff0f0">
+              <td style="font-family:monospace;font-weight:700;color:#C00000">
+                {e(m['id'])}</td>
+              <td>{e(m['host'])}</td>
+              <td>{e(m['severity'])}</td>
+              <td>{e(m.get('matched_reason', ''))}</td>
+              <td style="font-size:9pt">{e(m.get('desc', '')[:130])}</td>
+            </tr>""" for m in d["wl_matches"])
+            wl_block = f"""<div style="background:#fff0f0;border:1.5px solid #C00000;
+                border-radius:4px;padding:10px;margin:10px 0">
+              <b style="color:#C00000">Day-1 Watchlist: {len(d['wl_matches'])}
+                CVE(s) matched on {e(d['domain'])}</b>
+              <table style="margin-top:8px"><thead><tr>
+                <th>CVE</th><th>Host</th><th>Severity</th>
+                <th>Match Reason</th><th>Description</th></tr></thead>
+                <tbody>{wl_rows}</tbody></table></div>"""
+        vh_block = ""
+        if d.get("vhosts"):
+            vh_rows = "".join(f"""<tr>
+              <td style="font-family:monospace">{e(v['ip'])}</td>
+              <td style="font-size:9pt">{e(', '.join(v['hosts']))}</td>
+              <td style="text-align:center">{v['count']}</td>
+            </tr>""" for v in d["vhosts"])
+            vh_block = f"""<div style="background:#f4f6ff;border:1px solid #c9d2ff;
+                border-radius:4px;padding:10px;margin:10px 0">
+              <b style="color:#1a1a24">Virtual Hosts — {len(d['vhosts'])}
+                shared IP(s)</b>
+              <table style="margin-top:8px"><thead><tr>
+                <th>IP</th><th>Hostnames</th><th>Count</th></tr></thead>
+                <tbody>{vh_rows}</tbody></table></div>"""
+        domain_blocks += f"""<div style="margin-bottom:24px;border:1px solid #ddd;
+            border-radius:6px;overflow:hidden">
+          <div style="background:#1a1a24;color:#FFE600;padding:9px 14px;
+               font-weight:700">{e(d['domain'])}
+            <span style="color:#999;font-weight:400;font-size:9pt">
+              &nbsp;{len(cves)} CVEs &middot; {d['elapsed']}</span></div>
+          {vh_block}
+          {wl_block}
+          <table><thead><tr><th>CVE ID</th><th>Host</th><th>Severity</th>
+            <th>CVSS</th><th>Description</th><th>Affected</th><th>Fix</th>
+          </tr></thead><tbody>{rows}</tbody></table></div>"""
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>CVEScan Pro Report</title><style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Segoe UI',Arial,sans-serif;background:#f0f2f5;
+     color:#1a1a24;font-size:11pt}}
+.cover{{background:#1a1a24;color:#fff;padding:48px 50px}}
+.cover h1{{font-size:21pt;margin-top:14px;color:#FFE600}}
+.meta{{margin-top:14px;color:#aaa;line-height:1.9;font-size:10pt}}
+.meta b{{color:#FFE600}}
+.badge{{display:inline-block;margin-top:16px;background:{rc};color:#fff;
+       padding:6px 20px;font-weight:900;letter-spacing:2px}}
+.page{{background:#fff;padding:32px 50px}}
+.stats{{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}}
+.stat{{flex:1;min-width:110px;background:#f8f8f8;border-top:3px solid #FFE600;
+      padding:12px;text-align:center}}
+.stat .v{{font-size:21pt;font-weight:900}}
+.stat .l{{font-size:8pt;color:#888;text-transform:uppercase;letter-spacing:1px}}
+table{{width:100%;border-collapse:collapse;font-size:9.5pt}}
+th{{background:#1a1a24;color:#FFE600;padding:7px 9px;text-align:left;font-size:8.5pt}}
+td{{padding:6px 9px;border-bottom:1px solid #eee;vertical-align:top}}
+h2{{font-size:13pt;border-left:4px solid #FFE600;padding-left:10px;margin:22px 0 12px}}
+@media print{{.cover,th,.badge,.stat{{-webkit-print-color-adjust:exact;
+  print-color-adjust:exact}}}}
+</style></head><body>
+<div class="cover">
+  <div style="letter-spacing:3px;color:#FFE600;font-size:10pt">
+    CVESCAN PRO &mdash; WEB EDITION &mdash; VULNERABILITY ASSESSMENT</div>
+  <h1>Live CVE Scan Report</h1>
+  <div class="meta">
+    {"Client: <b>" + e(scan['client']) + "</b><br>" if scan.get('client') else ""}
+    Targets: <b>{e(', '.join(scan['targets']))}</b><br>
+    Date: <b>{today}</b><br>
+    Sources: <b>NVD &middot; OSV &middot; CISA-KEV &middot; GitHub Advisories
+      &middot; Day-1 Watchlist</b><br>
+    Watchlist tracked: <b>{scan.get('watchlist_count', 0)}</b>
+      &middot; Pending NVD: <b>{scan.get('watchlist_pending', 0)}</b>
+  </div>
+  <div class="badge">OVERALL RISK: {st['risk']}</div>
+</div>
+<div class="page">
+  <h2>Executive Summary</h2>
+  <div class="stats">
+    <div class="stat"><div class="v">{st['domains']}</div><div class="l">Domains</div></div>
+    <div class="stat"><div class="v">{st['hosts']}</div><div class="l">Hosts</div></div>
+    <div class="stat"><div class="v">{st['total_cves']}</div><div class="l">Total CVEs</div></div>
+    <div class="stat"><div class="v" style="color:#C00000">{st['critical']}</div>
+      <div class="l">Critical</div></div>
+    <div class="stat"><div class="v" style="color:#E26B0A">{st['high']}</div>
+      <div class="l">High</div></div>
+    <div class="stat"><div class="v" style="color:#C00000">{st['kev']}</div>
+      <div class="l">Exploited (KEV)</div></div>
+    <div class="stat"><div class="v" style="color:#C00000">{st['watchlist_hits']}</div>
+      <div class="l">Watchlist Hits</div></div>
+  </div>
+  <h2>Findings by Domain</h2>
+  {domain_blocks or '<p style="color:#888">No CVEs matched.</p>'}
+  <p style="margin-top:24px;font-size:8.5pt;color:#999">
+    Generated by CVEScan Pro Web Edition. Authorised assessment use only.</p>
+</div></body></html>"""
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\n  CVEScan Pro Web Edition  ->  http://127.0.0.1:{port}\n")
+    app.run(host="0.0.0.0", port=port, debug=bool(os.environ.get("FLASK_DEBUG")))
