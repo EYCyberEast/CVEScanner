@@ -8,7 +8,8 @@ add CVE IDs), and **AI analysis powered by Google Gemini**.
 ## What it does
 
 - **Domain recon** — subdomain enumeration (crt.sh, HackerTarget, AlienVault,
-  brute-force), port scanning, technology fingerprinting.
+  brute-force), port scanning, technology fingerprinting, and **virtual-host
+  detection** (multiple hostnames sharing one IP).
 - **Live CVE matching** against four free sources: NVD, OSV, CISA KEV,
   GitHub Security Advisories.
 - **Automated Day-1 Watchlist** — paste or upload your team's CVE numbers
@@ -16,10 +17,12 @@ add CVE IDs), and **AI analysis powered by Google Gemini**.
   against every scanned host. No source-code editing.
 - **AI Insights — Gemini, OpenAI, Claude or Groq** — bring whichever API key
   you have. Per-CVE plain-English risk explanations with a patch-priority
-  verdict, board-level executive summaries, a prioritised remediation triage
-  plan, and a Q&A chat grounded in your scan data.
-- **Reports** — download a self-contained HTML report (print to PDF) or JSON
-  for SIEM / ticketing integration.
+  verdict and exploit-status assessment; board-level executive summaries; a
+  prioritised remediation triage plan; an **AI Deep Analysis** that correlates
+  fingerprints to surface likely CVEs, exposed services and an exploitability
+  assessment; and a Q&A chat grounded in your scan data.
+- **Reports** — download as **PDF**, self-contained **HTML**, or **JSON**
+  (for SIEM / ticketing integration).
 
 ## Project layout
 
