@@ -360,16 +360,20 @@
       </div>
       <div class="panel">
         <h2>Scan Intelligence</h2>
-        <div class="sub">Generate AI analysis for the most recent completed
-          scan.</div>
+        <div class="sub">AI analysis of the most recent completed scan.
+          Deep Analysis correlates fingerprints to surface likely CVEs,
+          exposed services and an exploitability assessment.</div>
         <div class="actions">
           <button class="btn-primary" onclick="aiSummary()"
             id="aiSumBtn">Executive Summary</button>
           <button class="btn-ghost" onclick="aiTriage()"
             id="aiTriBtn">Remediation Triage Plan</button>
+          <button class="btn-ghost" onclick="aiDeep()"
+            id="aiDeepBtn">AI Deep Analysis</button>
         </div>
         <div id="aiSumOut"></div>
         <div id="aiTriOut"></div>
+        <div id="aiDeepOut"></div>
       </div>
       <div class="panel">
         <h2>Ask the Analyst</h2>
@@ -601,11 +605,15 @@ function renderResults(scan){
       <div class="stat high"><div class="v">${st.high}</div><div class="l">High</div></div>
       <div class="stat kev"><div class="v">${st.kev}</div><div class="l">Exploited (KEV)</div></div>
       <div class="stat kev"><div class="v">${st.watchlist_hits}</div><div class="l">Watchlist Hits</div></div>
+      <div class="stat"><div class="v">${st.shared_ips||0}</div><div class="l">Virtual Hosts</div></div>
     </div>
     <div class="actions">
       <button class="btn-primary btn-sm"
+        onclick="window.open('/api/report/${scan.job_id}?fmt=pdf')">
+        Download PDF Report</button>
+      <button class="btn-ghost btn-sm"
         onclick="window.open('/api/report/${scan.job_id}?fmt=html')">
-        Download HTML Report</button>
+        Download HTML</button>
       <button class="btn-ghost btn-sm"
         onclick="window.open('/api/report/${scan.job_id}?fmt=json')">
         Download JSON</button>
@@ -614,10 +622,23 @@ function renderResults(scan){
   scan.domains.forEach(d=>{
     const cves=[];
     d.results.forEach(h=>h.cves.forEach(c=>cves.push({...c,host:h.host,ip:h.ip})));
-    if(!cves.length && !d.wl_matches.length) return;
+    const vh=d.vhosts||[];
+    if(!cves.length && !d.wl_matches.length && !vh.length) return;
     html+=`<div class="domain-hd"><span>🌐 ${esc(d.domain)}</span>
       <span class="meta">${d.results.length} hosts · ${cves.length} CVEs ·
       ${d.elapsed}</span></div>`;
+    if(vh.length){
+      html+=`<div class="panel"><h2>Virtual Hosts — shared IP addresses
+        <span class="badge mono">${vh.length}</span></h2>
+        <div class="sub">Multiple hostnames served from one IP — a single
+          server compromise can expose all of them.</div>
+        <div class="tbl-wrap"><table><thead><tr><th>IP</th>
+        <th>Hostnames</th><th>Count</th></tr></thead><tbody>`+
+        vh.map(v=>`<tr><td class="mono">${esc(v.ip)}</td>
+          <td>${esc(v.hosts.join(', '))}</td>
+          <td class="mono">${v.count}</td></tr>`).join('')
+        +`</tbody></table></div></div>`;
+    }
     if(d.wl_matches.length){
       html+=`<div class="panel" style="border-color:var(--crit)">
         <h2 style="color:var(--crit)">Day-1 Watchlist Matches —
@@ -670,9 +691,9 @@ async function initAI(){
     $('aiBody').style.display='block';
     const sel=$('aiProvider');
     sel.innerHTML=Object.entries(s.providers)
-      .filter(([k,v])=>v.configured)
-      .map(([k,v])=>`<option value="${k}" ${k===s.active?'selected':''}>`
-        +`${esc(v.label)}</option>`).join('');
+      .map(([k,v])=>`<option value="${k}" ${k===s.active?'selected':''} `
+        +`${v.configured?'':'disabled'}>${esc(v.label)}`
+        +`${v.configured?'':' — no key set'}</option>`).join('');
     $('aiModelChip').innerHTML='<span class="dot on"></span> model <b>'
       +esc(s.model)+'</b>';
   }else{
@@ -754,6 +775,54 @@ async function aiTriage(){
       <b class="mono">${esc(it.cve||'')}</b> — ${esc(it.action||'')}</div>`).join('')
     +`</div></div>`).join('');
 }
+async function aiDeep(){
+  if(!needScan())return;
+  $('aiDeepBtn').disabled=true;
+  $('aiDeepBtn').innerHTML='<span class="spin"></span> Analysing…';
+  $('aiDeepOut').innerHTML='';
+  const j=await api('/api/ai/deep',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({job_id:lastScanResult.job_id})});
+  $('aiDeepBtn').disabled=false;
+  $('aiDeepBtn').textContent='AI Deep Analysis';
+  if(j.error){toast(j.error,true);return}
+  const r=j.result;
+  if(r._raw){
+    $('aiDeepOut').innerHTML='<div class="ai-card">'+esc(r._raw)+'</div>';return;
+  }
+  let html='';
+  const expl=r.exploitability||[];
+  if(expl.length){
+    html+='<div class="ai-card"><h3>Exploitability Assessment</h3>'
+      +'<div class="pill-list">'+expl.map(x=>{
+        const pe=(x.public_exploit||'').toLowerCase();
+        const cls=pe==='likely'?'v-today':pe==='possible'?'v-week':'v-mon';
+        return `<div class="pill"><b>${esc(x.target||'')}</b>
+          <span class="verdict ${cls}" style="margin-left:6px">exploit `
+          +`${esc(x.public_exploit||'?')}</span><br>
+          <span style="color:var(--dim)">${esc(x.assessment||'')}</span></div>`;
+      }).join('')+'</div></div>';
+  }
+  const exp=r.exposed_services||[];
+  if(exp.length){
+    html+='<div class="ai-card"><h3>Exposed / Risky Services</h3>'
+      +'<div class="pill-list">'+exp.map(x=>`<div class="pill">`
+        +`<b class="mono">${esc(x.host||'')}</b> — ${esc(x.service||'')}<br>`
+        +`<span style="color:var(--dim)">${esc(x.why_risky||'')}</span></div>`).join('')
+      +'</div></div>';
+  }
+  const lc=r.likely_cves||[];
+  if(lc.length){
+    html+='<div class="ai-card"><h3>Likely CVEs (AI-correlated)</h3>'
+      +'<div class="pill-list">'+lc.map(x=>`<div class="pill">`
+        +`<b class="mono">${esc(x.cve_or_class||'')}</b> on ${esc(x.host||'')}<br>`
+        +`<span style="color:var(--dim)">${esc(x.reason||'')}</span></div>`).join('')
+      +'</div></div>';
+  }
+  html+=listBlock('Misconfigurations',r.misconfigurations);
+  html+=listBlock('Priority Actions',r.priority_actions);
+  $('aiDeepOut').innerHTML=html||'<div class="ai-card">No analysis returned.</div>';
+}
 async function aiExplain(cve,btn){
   btn.disabled=true;btn.innerHTML='<span class="spin"></span>';
   const j=await api('/api/ai/explain',{
@@ -764,12 +833,16 @@ async function aiExplain(cve,btn){
   const r=j.result;
   const vClass={'PATCH TODAY':'v-today','PATCH THIS WEEK':'v-week',
     'SCHEDULE':'v-sched','MONITOR':'v-mon'}[r.verdict]||'v-sched';
+  const exC={'PUBLIC EXPLOIT LIKELY':'v-today','POC POSSIBLE':'v-week',
+    'NO KNOWN EXPLOIT':'v-mon'}[r.exploit_status]||'v-sched';
   const row=btn.closest('tr');
   const ex=document.createElement('tr');
   ex.innerHTML=`<td colspan="7" style="background:var(--bg)">
     <div class="ai-card" style="margin:0">
       <h3>${esc(r.cve_id)} — AI Analysis
-        <span class="verdict ${vClass}">${esc(r.verdict||'?')}</span></h3>
+        <span class="verdict ${vClass}">${esc(r.verdict||'?')}</span>
+        ${r.exploit_status?'<span class="verdict '+exC
+          +'" style="margin-left:6px">'+esc(r.exploit_status)+'</span>':''}</h3>
       <p>${esc(r.summary||r._raw||'')}</p>
       ${r.attack?'<p style="color:var(--dim);margin-top:6px"><b>Attack:</b> '
         +esc(r.attack)+'</p>':''}
@@ -812,4 +885,3 @@ setInterval(loadStatus,30000);
 </script>
 </body>
 </html>
-
