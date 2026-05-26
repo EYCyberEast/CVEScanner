@@ -968,3 +968,19 @@ def run_domain_scan(domain, merged_db, full=False):
         results.append(analyse_host(he, merged_db, full=full))
         set_progress(int((idx + 1) / max(len(unique), 1) * 100))
     return results
+
+
+def group_virtual_hosts(results):
+    """
+    Detect virtual hosting: multiple discovered hostnames served from the
+    same IP address. Returns a list of {ip, hosts:[...], count}.
+    """
+    by_ip = {}
+    for r in results:
+        ip = r.get("ip")
+        if ip:
+            by_ip.setdefault(ip, []).append(r.get("host"))
+    vhosts = [{"ip": ip, "hosts": sorted(set(names)), "count": len(set(names))}
+              for ip, names in by_ip.items() if len(set(names)) > 1]
+    vhosts.sort(key=lambda x: -x["count"])
+    return vhosts
